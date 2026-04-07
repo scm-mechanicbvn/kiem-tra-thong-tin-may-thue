@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Quét QR - Tra cứu Mã máy</title>
+  <style>
+    :root{font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial; color:#111}
+    body{margin:0;padding:18px;background:#f7f8fb}
+    .topbar{display:flex;align-items:center;gap:12px;margin-bottom:10px}
+    button{background:#0b79ff;color:#fff;border:0;padding:8px 12px;border-radius:6px;cursor:pointer;font-weight:600}
+    button.secondary{background:#6b7280}
+    .count{font-size:14px;color:#111;font-weight:600}
+    .meta{font-size:13px;color:#4b5563;margin-bottom:12px}
+    .hint{font-size:13px;color:#6b7280;margin-top:8px}
+    .scanner-wrap{display:none;margin:12px 0;position:relative}
+    video#qr-video{width:100%;max-width:640px;border-radius:8px;background:#000}
+    .close-scan{position:absolute;top:8px;right:8px;background:rgba(0,0,0,0.5);color:#fff;border-radius:6px;padding:6px 8px;border:0}
+    .result{margin-top:14px}
+    .not-found{color:#b91c1c;font-weight:700}
+    table{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 2px rgba(0,0,0,0.06)}
+    th,td{padding:10px 12px;border-bottom:1px solid #eef2f7;text-align:left;font-size:14px}
+    th{background:#f1f5f9;color:#0f172a;font-weight:700}
+    tr:last-child td{border-bottom:0}
+    .small{font-size:13px;color:#475569}
+    .center{display:flex;align-items:center;gap:8px}
+    .loader{width:14px;height:14px;border:2px solid #cbd5e1;border-top-color:#0b79ff;border-radius:50%;animation:spin 1s linear infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .footer-hint{margin-top:10px;color:#475569;font-size:13px}
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <button id="refreshBtn">Làm mới</button>
+    <div class="count">Đã đọc: <span id="count">0</span></div>
+    <div style="margin-left:auto" class="center">
+      <div id="loadingIndicator" style="display:none" class="loader" aria-hidden="true"></div>
+      <button id="scanBtn" class="secondary">Quét QR</button>
+    </div>
+  </div>
+
+  <div class="meta">
+    <span class="small">Cập nhật lần cuối: <strong id="lastUpdated">—</strong></span>
+  </div>
+
+  <div class="scanner-wrap" id="scannerWrap">
+    <button id="closeScan" class="close-scan">Đóng</button>
+    <video id="qr-video"></video>
+  </div>
+
+  <div class="result">
+    <div id="lookupResult" class="small"></div>
+    <div id="tableContainer" style="margin-top:10px"></div>
+  </div>
+
+  <div class="footer-hint">
+    Dữ liệu được lưu vào <strong>Local Storage</strong>. Nếu mã không tồn tại, hãy thử bấm "Làm mới" để cập nhật dữ liệu.
+  </div>
+
+  <script type="module">
+    import QrScanner from "https://cdn.jsdelivr.net/npm/qr-scanner/qr-scanner.min.js";
+
+    // URL API (Google Apps Script web app)
+    const API_URL = 'https://script.google.com/macros/s/AKfycbw-r2b6lEyZvygRzjOQlQOr9zS53p2EsV7M4GrQ2-reh6v14xl8L5s2zrMnhSyK3ZnX/exec';
+
+    // DOM
+    const refreshBtn = document.getElementById('refreshBtn');
+    const scanBtn = document.getElementById('scanBtn');
+    const countEl = document.getElementById('count');
+    const lastUpdatedEl = document.getElementById('lastUpdated');
+    const scannerWrap = document.getElementById('scannerWrap');
+    const qrVideo = document.getElementById('qr-video');
+    const closeScan = document.getElementById('closeScan');
+    const lookupResult = document.getElementById('lookupResult');
+    const tableContainer = document.getElementById('tableContainer');
+    const loadingIndicator = document.getElementById('loadingIndicator');
+
+    // Local storage keys
+    const LS_KEY_DATA = 'qr_device_data_v1';
+    const LS_KEY_TS = 'qr_device_data_ts_v1';
+
+    // In-memory data object (keys are Mã máy)
+    let deviceData = {};
+    let qrScanner = null;
+
+    // Util: format timestamp
+    function formatTS(ts) {
+      try {
+        const d = new Date(ts);
+        if (isNaN(d)) return '—';
+        return d.toLocaleString('vi-VN', { hour12: false });
+      } catch (e) { return '—'; }
+    }
+
+    // Load from localStorage on start
+    function loadFromLocal() {
+      try {
+        const raw = localStorage.getItem(LS_KEY_DATA);
+        const ts = localStorage.getItem(LS_KEY_TS);
+        if (raw) {
+          deviceData = JSON.parse(raw) || {};
+          countEl.textContent = Object.keys(deviceData).length;
+        } else {
+          deviceData = {};
+          countEl.textContent = 0;
+        }
+        lastUpdatedEl.textContent = ts ? formatTS(Number(ts)) : '—';
+      } catch (e) {
+        console.error('Load local error', e);
+        deviceData = {};
+        countEl.textContent = 0;
+        lastUpdatedEl.textContent = '—';
+      }
+    }
+
+    // Save to localStorage
+    function saveToLocal(dataObj) {
+      try {
+        localStorage.setItem(LS_KEY_DATA, JSON.stringify(dataObj));
+        localStorage.setItem(LS_KEY_TS, String(Date.now()));
+        lastUpdatedEl.textContent = formatTS(Date.now());
+      } catch (e) {
+        console.error('Save local error', e);
+      }
+    }
+
+    // Parse response text: handle JSON or JSONP
+    async function parseResponseText(text) {
+      text = text.trim();
+      // If starts with { or [, parse as JSON
+      if (text.startsWith('{') || text.startsWith('[')) {
+        return JSON.parse(text);
+      }
+      // Try to extract JSON inside callback(...) or callback && callback(...)
+      const m = text.match(/^[\w$]+\s*\(\s*([\s\S]+)\s*\)\s*;?$/);
+      if (m && m[1]) {
+        return JSON.parse(m[1]);
+      }
+      // Fallback: try to find first { ... } block
+      const firstBrace = text.indexOf('{');
+      const lastBrace = text.lastIndexOf('}');
+      if (firstBrace >= 0 && lastBrace > firstBrace) {
+        const sub = text.slice(firstBrace, lastBrace + 1);
+        return JSON.parse(sub);
+      }
+      throw new Error('Không thể phân tích phản hồi từ server');
+    }
+
+    // Fetch data from API and update local storage + UI
+    async function refreshData() {
+      loadingIndicator.style.display = 'inline-block';
+      refreshBtn.disabled = true;
+      try {
+        const url = API_URL + '?nocache=' + Date.now();
+        const resp = await fetch(url, { cache: 'no-store' });
+        const text = await resp.text();
+        const parsed = await parseResponseText(text);
+
+        // The server returns an object where keys are Mã máy and meta is present.
+        // Remove meta if exists.
+        const dataObj = Object.assign({}, parsed);
+        if (dataObj.meta) delete dataObj.meta;
+
+        // Ensure keys are strings and values are objects
+        const normalized = {};
+        for (const k of Object.keys(dataObj)) {
+          // skip non-device keys just in case
+          if (k === 'meta') continue;
+          normalized[String(k)] = dataObj[k];
+        }
+
+        deviceData = normalized;
+        saveToLocal(deviceData);
+        countEl.textContent = Object.keys(deviceData).length;
+        lookupResult.textContent = 'Đã cập nhật dữ liệu.';
+        tableContainer.innerHTML = ''; // clear previous display
+      } catch (err) {
+        console.error(err);
+        lookupResult.innerHTML = '<span class="not-found">Lỗi khi tải dữ liệu. Hãy thử lại.</span>';
+      } finally {
+        loadingIndicator.style.display = 'none';
+        refreshBtn.disabled = false;
+      }
+    }
+
+    // Render device info table for a given device object
+    function renderDeviceTable(deviceKey, deviceObj) {
+      if (!deviceObj) {
+        tableContainer.innerHTML = `<div class="not-found">Mã <strong>${escapeHtml(deviceKey)}</strong> không tồn tại trong dữ liệu. Hãy thử bấm "Làm mới".</div>`;
+        return;
+      }
+
+      // If server used structure { row, colStart, colEnd, fields, cellMap }
+      const fields = deviceObj.fields || deviceObj; // fallback if user stored raw object
+      // Build table rows from fields (prefer header order if meta.header exists)
+      let rowsHtml = '';
+      if (deviceObj.fields && Array.isArray(deviceObj.fields) === false) {
+        // fields is object with header names
+        for (const key of Object.keys(fields)) {
+          rowsHtml += `<tr><th>${escapeHtml(key)}</th><td>${escapeHtml(String(fields[key] === null || fields[key] === undefined ? '' : fields[key]))}</td></tr>`;
+        }
+      } else {
+        // fallback: iterate all keys of deviceObj
+        for (const key of Object.keys(deviceObj)) {
+          rowsHtml += `<tr><th>${escapeHtml(key)}</th><td>${escapeHtml(String(deviceObj[key] === null || deviceObj[key] === undefined ? '' : deviceObj[key]))}</td></tr>`;
+        }
+      }
+
+      tableContainer.innerHTML = `
+        <table aria-live="polite">
+          <thead><tr><th>Trường</th><th>Giá trị</th></tr></thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      `;
+    }
+
+    // Escape HTML to avoid injection
+    function escapeHtml(s) {
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
+    // Start QR scanner
+    async function startScanner() {
+      lookupResult.textContent = '';
+      tableContainer.innerHTML = '';
+      scannerWrap.style.display = 'block';
+      scanBtn.disabled = true;
+      refreshBtn.disabled = true;
+
+      // Ensure previous scanner stopped
+      if (qrScanner) {
+        try { qrScanner.stop(); } catch (e) {}
+        qrScanner = null;
+      }
+
+      qrScanner = new QrScanner(qrVideo, result => {
+        // On decode
+        handleScannedCode(result);
+      }, {
+        highlightScanRegion: true,
+        returnDetailedScanResult: false
+      });
+
+      try {
+        await qrScanner.start();
+      } catch (e) {
+        console.error('Camera start error', e);
+        lookupResult.innerHTML = '<span class="not-found">Không thể truy cập camera. Kiểm tra quyền trình duyệt.</span>';
+        stopScanner();
+      }
+    }
+
+    // Stop scanner and hide UI
+    function stopScanner() {
+      if (qrScanner) {
+        try { qrScanner.stop(); } catch (e) {}
+        qrScanner.destroy();
+        qrScanner = null;
+      }
+      scannerWrap.style.display = 'none';
+      scanBtn.disabled = false;
+      refreshBtn.disabled = false;
+    }
+
+    // Handle scanned code (assume it's Mã máy)
+    function handleScannedCode(code) {
+      stopScanner();
+      const ma = String(code).trim();
+      lookupResult.innerHTML = `<div>Quét được: <strong>${escapeHtml(ma)}</strong></div>`;
+      // Lookup in deviceData
+      const found = deviceData.hasOwnProperty(ma) ? deviceData[ma] : null;
+      if (found) {
+        renderDeviceTable(ma, found);
+      } else {
+        tableContainer.innerHTML = `<div class="not-found">Mã <strong>${escapeHtml(ma)}</strong> không tồn tại trong dữ liệu. Hãy thử bấm "Làm mới".</div>`;
+      }
+    }
+
+    // Event listeners
+    refreshBtn.addEventListener('click', () => {
+      refreshData();
+    });
+
+    scanBtn.addEventListener('click', () => {
+      startScanner();
+    });
+
+    closeScan.addEventListener('click', () => {
+      stopScanner();
+    });
+
+    // On load: initialize
+    (function init() {
+      loadFromLocal();
+
+      // If no local data, auto refresh once
+      if (Object.keys(deviceData).length === 0) {
+        // attempt to refresh but don't block UI
+        refreshData();
+      }
+
+      // Allow pressing Enter on page to focus scan (optional)
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+          stopScanner();
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

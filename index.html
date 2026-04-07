@@ -27,6 +27,7 @@
     .loader{width:14px;height:14px;border:2px solid #cbd5e1;border-top-color:#0b79ff;border-radius:50%;animation:spin 1s linear infinite}
     @keyframes spin{to{transform:rotate(360deg)}}
     .footer-hint{margin-top:10px;color:#475569;font-size:13px}
+    details pre{background:#f8fafc;padding:8px;border-radius:6px}
   </style>
 </head>
 <body>
@@ -60,10 +61,8 @@
   <script type="module">
     import QrScanner from "https://cdn.jsdelivr.net/npm/qr-scanner/qr-scanner.min.js";
 
-    // URL API (Google Apps Script web app)
     const API_URL = 'https://script.google.com/macros/s/AKfycbw-r2b6lEyZvygRzjOQlQOr9zS53p2EsV7M4GrQ2-reh6v14xl8L5s2zrMnhSyK3ZnX/exec';
 
-    // DOM
     const refreshBtn = document.getElementById('refreshBtn');
     const scanBtn = document.getElementById('scanBtn');
     const countEl = document.getElementById('count');
@@ -75,30 +74,28 @@
     const tableContainer = document.getElementById('tableContainer');
     const loadingIndicator = document.getElementById('loadingIndicator');
 
-    // Local storage keys
     const LS_KEY_DATA = 'qr_device_data_v1';
     const LS_KEY_TS = 'qr_device_data_ts_v1';
 
-    // In-memory data object (keys are Mã máy)
     let deviceData = {};
     let qrScanner = null;
+    let normalizedIndex = {}; // map normalizedKey -> originalKey
 
-    // Util: format timestamp
     function formatTS(ts) {
       try {
-        const d = new Date(ts);
+        const d = new Date(Number(ts));
         if (isNaN(d)) return '—';
         return d.toLocaleString('vi-VN', { hour12: false });
       } catch (e) { return '—'; }
     }
 
-    // Load from localStorage on start
     function loadFromLocal() {
       try {
         const raw = localStorage.getItem(LS_KEY_DATA);
         const ts = localStorage.getItem(LS_KEY_TS);
         if (raw) {
           deviceData = JSON.parse(raw) || {};
+          buildNormalizedIndex();
           countEl.textContent = Object.keys(deviceData).length;
         } else {
           deviceData = {};
@@ -113,7 +110,6 @@
       }
     }
 
-    // Save to localStorage
     function saveToLocal(dataObj) {
       try {
         localStorage.setItem(LS_KEY_DATA, JSON.stringify(dataObj));
@@ -124,19 +120,15 @@
       }
     }
 
-    // Parse response text: handle JSON or JSONP
     async function parseResponseText(text) {
       text = text.trim();
-      // If starts with { or [, parse as JSON
       if (text.startsWith('{') || text.startsWith('[')) {
         return JSON.parse(text);
       }
-      // Try to extract JSON inside callback(...) or callback && callback(...)
       const m = text.match(/^[\w$]+\s*\(\s*([\s\S]+)\s*\)\s*;?$/);
       if (m && m[1]) {
         return JSON.parse(m[1]);
       }
-      // Fallback: try to find first { ... } block
       const firstBrace = text.indexOf('{');
       const lastBrace = text.lastIndexOf('}');
       if (firstBrace >= 0 && lastBrace > firstBrace) {
@@ -146,34 +138,33 @@
       throw new Error('Không thể phân tích phản hồi từ server');
     }
 
-    // Fetch data from API and update local storage + UI
     async function refreshData() {
       loadingIndicator.style.display = 'inline-block';
       refreshBtn.disabled = true;
+      lookupResult.textContent = '';
       try {
         const url = API_URL + '?nocache=' + Date.now();
         const resp = await fetch(url, { cache: 'no-store' });
         const text = await resp.text();
         const parsed = await parseResponseText(text);
 
-        // The server returns an object where keys are Mã máy and meta is present.
-        // Remove meta if exists.
+        // Remove meta if present
         const dataObj = Object.assign({}, parsed);
         if (dataObj.meta) delete dataObj.meta;
 
-        // Ensure keys are strings and values are objects
+        // Normalize keys to strings
         const normalized = {};
         for (const k of Object.keys(dataObj)) {
-          // skip non-device keys just in case
           if (k === 'meta') continue;
           normalized[String(k)] = dataObj[k];
         }
 
         deviceData = normalized;
+        buildNormalizedIndex();
         saveToLocal(deviceData);
         countEl.textContent = Object.keys(deviceData).length;
         lookupResult.textContent = 'Đã cập nhật dữ liệu.';
-        tableContainer.innerHTML = ''; // clear previous display
+        tableContainer.innerHTML = '';
       } catch (err) {
         console.error(err);
         lookupResult.innerHTML = '<span class="not-found">Lỗi khi tải dữ liệu. Hãy thử lại.</span>';
@@ -183,24 +174,40 @@
       }
     }
 
-    // Render device info table for a given device object
+    function buildNormalizedIndex() {
+      normalizedIndex = {};
+      for (const k of Object.keys(deviceData)) {
+        const n = normalizeKey(k);
+        if (n) normalizedIndex[n] = k;
+      }
+    }
+
     function renderDeviceTable(deviceKey, deviceObj) {
       if (!deviceObj) {
         tableContainer.innerHTML = `<div class="not-found">Mã <strong>${escapeHtml(deviceKey)}</strong> không tồn tại trong dữ liệu. Hãy thử bấm "Làm mới".</div>`;
         return;
       }
 
-      // If server used structure { row, colStart, colEnd, fields, cellMap }
-      const fields = deviceObj.fields || deviceObj; // fallback if user stored raw object
-      // Build table rows from fields (prefer header order if meta.header exists)
+      const fields = deviceObj.fields || deviceObj;
       let rowsHtml = '';
-      if (deviceObj.fields && Array.isArray(deviceObj.fields) === false) {
-        // fields is object with header names
+
+      // If fields is an object with header names, preserve order by keys in fields
+      if (deviceObj.fields && typeof deviceObj.fields === 'object' && !Array.isArray(deviceObj.fields)) {
         for (const key of Object.keys(fields)) {
           rowsHtml += `<tr><th>${escapeHtml(key)}</th><td>${escapeHtml(String(fields[key] === null || fields[key] === undefined ? '' : fields[key]))}</td></tr>`;
         }
+      } else if (deviceObj.cellMap && typeof deviceObj.cellMap === 'object') {
+        // Prefer cellMap order A..H
+        const letters = Object.keys(deviceObj.cellMap).sort((a,b) => columnLetterToNumber(a) - columnLetterToNumber(b));
+        for (const letter of letters) {
+          rowsHtml += `<tr><th>${escapeHtml(letter)}</th><td>${escapeHtml(String(deviceObj.cellMap[letter] === null || deviceObj.cellMap[letter] === undefined ? '' : deviceObj.cellMap[letter]))}</td></tr>`;
+        }
+        // Also include other top-level fields
+        for (const k of Object.keys(deviceObj)) {
+          if (['cellMap','fields','row','colStart','colEnd'].includes(k)) continue;
+          rowsHtml += `<tr><th>${escapeHtml(k)}</th><td>${escapeHtml(String(deviceObj[k] === null || deviceObj[k] === undefined ? '' : deviceObj[k]))}</td></tr>`;
+        }
       } else {
-        // fallback: iterate all keys of deviceObj
         for (const key of Object.keys(deviceObj)) {
           rowsHtml += `<tr><th>${escapeHtml(key)}</th><td>${escapeHtml(String(deviceObj[key] === null || deviceObj[key] === undefined ? '' : deviceObj[key]))}</td></tr>`;
         }
@@ -214,7 +221,6 @@
       `;
     }
 
-    // Escape HTML to avoid injection
     function escapeHtml(s) {
       return String(s)
         .replace(/&/g, '&amp;')
@@ -224,7 +230,14 @@
         .replace(/'/g, '&#039;');
     }
 
-    // Start QR scanner
+    function columnLetterToNumber(letter) {
+      let num = 0;
+      for (let i = 0; i < letter.length; i++) {
+        num = num * 26 + (letter.charCodeAt(i) - 64);
+      }
+      return num;
+    }
+
     async function startScanner() {
       lookupResult.textContent = '';
       tableContainer.innerHTML = '';
@@ -232,14 +245,12 @@
       scanBtn.disabled = true;
       refreshBtn.disabled = true;
 
-      // Ensure previous scanner stopped
       if (qrScanner) {
         try { qrScanner.stop(); } catch (e) {}
         qrScanner = null;
       }
 
       qrScanner = new QrScanner(qrVideo, result => {
-        // On decode
         handleScannedCode(result);
       }, {
         highlightScanRegion: true,
@@ -255,11 +266,10 @@
       }
     }
 
-    // Stop scanner and hide UI
     function stopScanner() {
       if (qrScanner) {
         try { qrScanner.stop(); } catch (e) {}
-        qrScanner.destroy();
+        try { qrScanner.destroy(); } catch (e) {}
         qrScanner = null;
       }
       scannerWrap.style.display = 'none';
@@ -267,21 +277,155 @@
       refreshBtn.disabled = false;
     }
 
-    // Handle scanned code (assume it's Mã máy)
-    function handleScannedCode(code) {
+    function decodeURIComponentSafe(s) {
+      try { return decodeURIComponent(s); } catch (e) { return s; }
+    }
+
+    function normalizeKey(s) {
+      if (s === null || s === undefined) return '';
+      return String(s)
+        .trim()
+        .toLowerCase()
+        .replace(/đ/g, 'd')
+        .replace(/\s+/g, '')
+        .replace(/[^a-z0-9]/g, '');
+    }
+
+    function tryExtractCodeFromObject(obj) {
+      if (!obj || typeof obj !== 'object') return null;
+      const candidates = ['data','text','code','id','ma','ma_may','mã','mã_máy','device','deviceId','device_id'];
+      for (const k of candidates) {
+        if (k in obj && obj[k]) return String(obj[k]);
+      }
+      // If object has nested simple structure like {code: "..."} or {data:{code:"..."}}
+      for (const k of Object.keys(obj)) {
+        const v = obj[k];
+        if (typeof v === 'string' && v.trim().length > 0) return v;
+        if (typeof v === 'object') {
+          const nested = tryExtractCodeFromObject(v);
+          if (nested) return nested;
+        }
+      }
+      return null;
+    }
+
+    function handleScannedCode(rawResult) {
       stopScanner();
-      const ma = String(code).trim();
-      lookupResult.innerHTML = `<div>Quét được: <strong>${escapeHtml(ma)}</strong></div>`;
-      // Lookup in deviceData
-      const found = deviceData.hasOwnProperty(ma) ? deviceData[ma] : null;
-      if (found) {
-        renderDeviceTable(ma, found);
+
+      console.log('QR raw result:', rawResult);
+
+      // rawResult may be string or object depending on library and QR content
+      let codeStr = '';
+
+      if (rawResult === null || rawResult === undefined) {
+        codeStr = '';
+      } else if (typeof rawResult === 'string') {
+        codeStr = rawResult;
+      } else if (typeof rawResult === 'object') {
+        // QrScanner sometimes returns an object with .data or .text
+        codeStr = rawResult.data || rawResult.text || '';
+        if (!codeStr) {
+          // try to extract from object fields
+          const extracted = tryExtractCodeFromObject(rawResult);
+          if (extracted) codeStr = extracted;
+        }
+        if (!codeStr) {
+          // fallback to JSON string for debug
+          try { codeStr = JSON.stringify(rawResult); } catch (e) { codeStr = String(rawResult); }
+        }
       } else {
-        tableContainer.innerHTML = `<div class="not-found">Mã <strong>${escapeHtml(ma)}</strong> không tồn tại trong dữ liệu. Hãy thử bấm "Làm mới".</div>`;
+        codeStr = String(rawResult);
+      }
+
+      codeStr = String(codeStr).trim();
+
+      // If codeStr looks like a URL, try to extract last path segment or query param 'code','id','ma'
+      let possibleCodes = [codeStr];
+      try {
+        if (codeStr.startsWith('http://') || codeStr.startsWith('https://')) {
+          try {
+            const u = new URL(codeStr);
+            // try common query params
+            const qCandidates = ['code','id','ma','device','deviceId','serial'];
+            for (const q of qCandidates) {
+              if (u.searchParams.has(q)) {
+                possibleCodes.unshift(u.searchParams.get(q));
+              }
+            }
+            // last path segment
+            const parts = u.pathname.split('/').filter(Boolean);
+            if (parts.length) possibleCodes.unshift(parts[parts.length - 1]);
+          } catch (e) { /* ignore */ }
+        }
+      } catch (e) { /* ignore */ }
+
+      // If codeStr is JSON, try parse and extract fields
+      try {
+        if ((codeStr.startsWith('{') && codeStr.endsWith('}')) || (codeStr.startsWith('[') && codeStr.endsWith(']'))) {
+          const parsed = JSON.parse(codeStr);
+          const extracted = tryExtractCodeFromObject(parsed);
+          if (extracted) possibleCodes.unshift(extracted);
+        }
+      } catch (e) { /* ignore */ }
+
+      // Add decoded URI variant and normalized variants
+      const expanded = [];
+      for (const p of possibleCodes) {
+        if (!p) continue;
+        expanded.push(p);
+        expanded.push(decodeURIComponentSafe(p));
+        expanded.push(p.toLowerCase());
+        expanded.push(p.toUpperCase());
+        expanded.push(normalizeKey(p));
+      }
+
+      // Remove duplicates while preserving order
+      const seen = new Set();
+      const candidates = [];
+      for (const s of expanded) {
+        if (!s) continue;
+        const key = String(s);
+        if (!seen.has(key)) {
+          seen.add(key);
+          candidates.push(key);
+        }
+      }
+
+      // Display scanned raw for user
+      lookupResult.innerHTML = `<div>Quét được: <strong>${escapeHtml(codeStr)}</strong></div>`;
+
+      // Try to find match in deviceData
+      let foundKey = null;
+      for (const cand of candidates) {
+        // direct match
+        if (deviceData.hasOwnProperty(cand)) { foundKey = cand; break; }
+        // case-insensitive match
+        for (const k of Object.keys(deviceData)) {
+          if (String(k).toLowerCase() === String(cand).toLowerCase()) { foundKey = k; break; }
+        }
+        if (foundKey) break;
+        // normalized match
+        const n = normalizeKey(cand);
+        if (n && normalizedIndex[n]) { foundKey = normalizedIndex[n]; break; }
+      }
+
+      if (foundKey) {
+        renderDeviceTable(foundKey, deviceData[foundKey]);
+      } else {
+        tableContainer.innerHTML = `
+          <div class="not-found">
+            Mã <strong>${escapeHtml(codeStr)}</strong> không tồn tại trong dữ liệu.
+            <div class="small" style="margin-top:6px;color:#475569">
+              Thử bấm "Làm mới" để cập nhật dữ liệu hoặc kiểm tra mã QR (có thể chứa JSON/URL).
+            </div>
+            <details style="margin-top:8px;color:#475569">
+              <summary class="small">Chi tiết quét (debug)</summary>
+              <pre style="white-space:pre-wrap;word-break:break-word">${escapeHtml(String(codeStr))}</pre>
+            </details>
+          </div>`;
       }
     }
 
-    // Event listeners
     refreshBtn.addEventListener('click', () => {
       refreshData();
     });
@@ -294,22 +438,15 @@
       stopScanner();
     });
 
-    // On load: initialize
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') stopScanner();
+    });
+
     (function init() {
       loadFromLocal();
-
-      // If no local data, auto refresh once
       if (Object.keys(deviceData).length === 0) {
-        // attempt to refresh but don't block UI
         refreshData();
       }
-
-      // Allow pressing Enter on page to focus scan (optional)
-      document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') {
-          stopScanner();
-        }
-      });
     })();
   </script>
 </body>

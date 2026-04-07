@@ -33,7 +33,7 @@
 <body>
   <div class="topbar">
     <button id="refreshBtn">Làm mới</button>
-    <div class="count">Tổng máy thuê: <span id="count">0</span></div>
+    <div class="count">Tổng Máy Thuê: <span id="count">0</span></div>
     <div style="margin-left:auto" class="center">
       <div id="loadingIndicator" style="display:none" class="loader" aria-hidden="true"></div>
       <button id="scanBtn" class="secondary">Quét QR</button>
@@ -61,7 +61,7 @@
   <script type="module">
     import QrScanner from "https://cdn.jsdelivr.net/npm/qr-scanner/qr-scanner.min.js";
 
-    const API_URL = 'https://script.google.com/macros/s/AKfycbw-r2b6lEyZvygRzjOQlQOr9zS53p2EsV7M4GrQ2-reh6v14xl8L5s2zrMnhSyK3ZnX/exec';
+    const API_URL = 'https://script.google.com/macros/s/AKfycbyt82YpZYFda5NkECD3vBOWJ2zhA3vNaBYZ1Q7MKMdLsGkVf-NY1IBijtXAhz3nzR_r/exec';
 
     const refreshBtn = document.getElementById('refreshBtn');
     const scanBtn = document.getElementById('scanBtn');
@@ -76,10 +76,12 @@
 
     const LS_KEY_DATA = 'qr_device_data_v1';
     const LS_KEY_TS = 'qr_device_data_ts_v1';
+    const LS_KEY_HEADERS = 'qr_device_headers_v1';
 
     let deviceData = {};
+    let headerOrder = []; // giữ thứ tự header từ server
     let qrScanner = null;
-    let normalizedIndex = {}; // map normalizedKey -> originalKey
+    let normalizedIndex = {};
 
     function formatTS(ts) {
       try {
@@ -93,18 +95,22 @@
       try {
         const raw = localStorage.getItem(LS_KEY_DATA);
         const ts = localStorage.getItem(LS_KEY_TS);
+        const hdr = localStorage.getItem(LS_KEY_HEADERS);
         if (raw) {
           deviceData = JSON.parse(raw) || {};
+          headerOrder = hdr ? JSON.parse(hdr) : [];
           buildNormalizedIndex();
           countEl.textContent = Object.keys(deviceData).length;
         } else {
           deviceData = {};
+          headerOrder = [];
           countEl.textContent = 0;
         }
         lastUpdatedEl.textContent = ts ? formatTS(Number(ts)) : '—';
       } catch (e) {
         console.error('Load local error', e);
         deviceData = {};
+        headerOrder = [];
         countEl.textContent = 0;
         lastUpdatedEl.textContent = '—';
       }
@@ -114,6 +120,9 @@
       try {
         localStorage.setItem(LS_KEY_DATA, JSON.stringify(dataObj));
         localStorage.setItem(LS_KEY_TS, String(Date.now()));
+        if (headerOrder && headerOrder.length) {
+          localStorage.setItem(LS_KEY_HEADERS, JSON.stringify(headerOrder));
+        }
         lastUpdatedEl.textContent = formatTS(Date.now());
       } catch (e) {
         console.error('Save local error', e);
@@ -148,11 +157,15 @@
         const text = await resp.text();
         const parsed = await parseResponseText(text);
 
-        // Remove meta if present
+        // Lấy meta.headers nếu có
+        if (parsed && parsed.meta && Array.isArray(parsed.meta.headers)) {
+          headerOrder = parsed.meta.headers;
+        }
+
+        // Remove meta and build deviceData
         const dataObj = Object.assign({}, parsed);
         if (dataObj.meta) delete dataObj.meta;
 
-        // Normalize keys to strings
         const normalized = {};
         for (const k of Object.keys(dataObj)) {
           if (k === 'meta') continue;
@@ -191,18 +204,24 @@
       const fields = deviceObj.fields || deviceObj;
       let rowsHtml = '';
 
-      // If fields is an object with header names, preserve order by keys in fields
-      if (deviceObj.fields && typeof deviceObj.fields === 'object' && !Array.isArray(deviceObj.fields)) {
-        for (const key of Object.keys(fields)) {
-          rowsHtml += `<tr><th>${escapeHtml(key)}</th><td>${escapeHtml(String(fields[key] === null || fields[key] === undefined ? '' : fields[key]))}</td></tr>`;
+      // Nếu có headerOrder, hiển thị theo thứ tự đó
+      if (Array.isArray(headerOrder) && headerOrder.length) {
+        for (const h of headerOrder) {
+          const val = (fields && (h in fields)) ? fields[h] : '';
+          rowsHtml += `<tr><th>${escapeHtml(h)}</th><td>${escapeHtml(String(val === null || val === undefined ? '' : val))}</td></tr>`;
+        }
+        // thêm các trường còn lại (không nằm trong headerOrder)
+        for (const k of Object.keys(fields)) {
+          if (headerOrder.indexOf(k) === -1) {
+            rowsHtml += `<tr><th>${escapeHtml(k)}</th><td>${escapeHtml(String(fields[k] === null || fields[k] === undefined ? '' : fields[k]))}</td></tr>`;
+          }
         }
       } else if (deviceObj.cellMap && typeof deviceObj.cellMap === 'object') {
-        // Prefer cellMap order A..H
+        // fallback: hiển thị theo cellMap A..O
         const letters = Object.keys(deviceObj.cellMap).sort((a,b) => columnLetterToNumber(a) - columnLetterToNumber(b));
         for (const letter of letters) {
           rowsHtml += `<tr><th>${escapeHtml(letter)}</th><td>${escapeHtml(String(deviceObj.cellMap[letter] === null || deviceObj.cellMap[letter] === undefined ? '' : deviceObj.cellMap[letter]))}</td></tr>`;
         }
-        // Also include other top-level fields
         for (const k of Object.keys(deviceObj)) {
           if (['cellMap','fields','row','colStart','colEnd'].includes(k)) continue;
           rowsHtml += `<tr><th>${escapeHtml(k)}</th><td>${escapeHtml(String(deviceObj[k] === null || deviceObj[k] === undefined ? '' : deviceObj[k]))}</td></tr>`;
@@ -297,7 +316,6 @@
       for (const k of candidates) {
         if (k in obj && obj[k]) return String(obj[k]);
       }
-      // If object has nested simple structure like {code: "..."} or {data:{code:"..."}}
       for (const k of Object.keys(obj)) {
         const v = obj[k];
         if (typeof v === 'string' && v.trim().length > 0) return v;
@@ -314,7 +332,6 @@
 
       console.log('QR raw result:', rawResult);
 
-      // rawResult may be string or object depending on library and QR content
       let codeStr = '';
 
       if (rawResult === null || rawResult === undefined) {
@@ -322,15 +339,12 @@
       } else if (typeof rawResult === 'string') {
         codeStr = rawResult;
       } else if (typeof rawResult === 'object') {
-        // QrScanner sometimes returns an object with .data or .text
         codeStr = rawResult.data || rawResult.text || '';
         if (!codeStr) {
-          // try to extract from object fields
           const extracted = tryExtractCodeFromObject(rawResult);
           if (extracted) codeStr = extracted;
         }
         if (!codeStr) {
-          // fallback to JSON string for debug
           try { codeStr = JSON.stringify(rawResult); } catch (e) { codeStr = String(rawResult); }
         }
       } else {
@@ -339,36 +353,31 @@
 
       codeStr = String(codeStr).trim();
 
-      // If codeStr looks like a URL, try to extract last path segment or query param 'code','id','ma'
       let possibleCodes = [codeStr];
       try {
         if (codeStr.startsWith('http://') || codeStr.startsWith('https://')) {
           try {
             const u = new URL(codeStr);
-            // try common query params
             const qCandidates = ['code','id','ma','device','deviceId','serial'];
             for (const q of qCandidates) {
               if (u.searchParams.has(q)) {
                 possibleCodes.unshift(u.searchParams.get(q));
               }
             }
-            // last path segment
             const parts = u.pathname.split('/').filter(Boolean);
             if (parts.length) possibleCodes.unshift(parts[parts.length - 1]);
-          } catch (e) { /* ignore */ }
+          } catch (e) {}
         }
-      } catch (e) { /* ignore */ }
+      } catch (e) {}
 
-      // If codeStr is JSON, try parse and extract fields
       try {
         if ((codeStr.startsWith('{') && codeStr.endsWith('}')) || (codeStr.startsWith('[') && codeStr.endsWith(']'))) {
           const parsed = JSON.parse(codeStr);
           const extracted = tryExtractCodeFromObject(parsed);
           if (extracted) possibleCodes.unshift(extracted);
         }
-      } catch (e) { /* ignore */ }
+      } catch (e) {}
 
-      // Add decoded URI variant and normalized variants
       const expanded = [];
       for (const p of possibleCodes) {
         if (!p) continue;
@@ -379,7 +388,6 @@
         expanded.push(normalizeKey(p));
       }
 
-      // Remove duplicates while preserving order
       const seen = new Set();
       const candidates = [];
       for (const s of expanded) {
@@ -391,20 +399,15 @@
         }
       }
 
-      // Display scanned raw for user
       lookupResult.innerHTML = `<div>Quét được: <strong>${escapeHtml(codeStr)}</strong></div>`;
 
-      // Try to find match in deviceData
       let foundKey = null;
       for (const cand of candidates) {
-        // direct match
         if (deviceData.hasOwnProperty(cand)) { foundKey = cand; break; }
-        // case-insensitive match
         for (const k of Object.keys(deviceData)) {
           if (String(k).toLowerCase() === String(cand).toLowerCase()) { foundKey = k; break; }
         }
         if (foundKey) break;
-        // normalized match
         const n = normalizeKey(cand);
         if (n && normalizedIndex[n]) { foundKey = normalizedIndex[n]; break; }
       }
